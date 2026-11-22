@@ -1,3 +1,5 @@
+import hashlib
+import json
 import math
 import os
 from threading import Lock
@@ -12,6 +14,7 @@ import warnings
 from . import values  # retain this import style for testability
 from .context_managers import ExceptionCounter, InprogressTracker, Timer
 from .metrics_core import Metric
+from .quantiles import Estimator
 from .registry import Collector, CollectorRegistry, REGISTRY
 from .samples import Exemplar, Sample
 from .utils import floatToGoString, INF
@@ -541,15 +544,80 @@ class Summary(MetricWrapperBase):
 
         with REQUEST_TIME.time():
             pass  # Logic to be timed
+
+    Example for a Summary tracking quantiles over a sliding time window:
+
+        from prometheus_client import Summary
+
+        s = Summary('request_latency_seconds', 'Request latency (seconds)',
+                    objectives={0.5: 0.05, 0.9: 0.01, 0.99: 0.001})
+
+    Quantiles are estimated with bounded error over a sliding window of
+    `max_age` seconds (split into `age_buckets` buckets), without storing
+    raw observations. Pass `checkpoint_dir` (or set the
+    PROMETHEUS_SUMMARY_CHECKPOINT_DIR environment variable) to persist the
+    compressed estimator state to disk, so that quantiles resume across
+    process restarts instead of being recomputed from scratch.
+
+    Quantile estimation is per-process and is not aggregated in
+    multiprocess mode.
     """
     _type = 'summary'
     _reserved_labelnames = ['quantile']
+
+    def __init__(self,
+                 name: str,
+                 documentation: str,
+                 labelnames: Iterable[str] = (),
+                 namespace: str = '',
+                 subsystem: str = '',
+                 unit: str = '',
+                 registry: Optional[CollectorRegistry] = REGISTRY,
+                 _labelvalues: Optional[Sequence[str]] = None,
+                 objectives: Optional[Dict[float, float]] = None,
+                 max_age: float = 600.0,
+                 age_buckets: int = 5,
+                 checkpoint_dir: Optional[str] = None,
+                 ):
+        self._objectives = objectives
+        self._max_age = max_age
+        self._age_buckets = age_buckets
+        self._checkpoint_dir = checkpoint_dir or os.environ.get('PROMETHEUS_SUMMARY_CHECKPOINT_DIR')
+        self._estimator: Optional[Estimator] = None
+        super().__init__(
+            name=name,
+            documentation=documentation,
+            labelnames=labelnames,
+            namespace=namespace,
+            subsystem=subsystem,
+            unit=unit,
+            registry=registry,
+            _labelvalues=_labelvalues,
+        )
+        if objectives is not None:
+            self._kwargs['objectives'] = objectives
+            self._kwargs['max_age'] = max_age
+            self._kwargs['age_buckets'] = age_buckets
+            self._kwargs['checkpoint_dir'] = checkpoint_dir
 
     def _metric_init(self) -> None:
         self._count = values.ValueClass(self._type, self._name, self._name + '_count', self._labelnames,
                                         self._labelvalues, self._documentation)
         self._sum = values.ValueClass(self._type, self._name, self._name + '_sum', self._labelnames, self._labelvalues, self._documentation)
         self._created = time.time()
+        if self._objectives is not None:
+            self._estimator = Estimator(
+                self._objectives,
+                max_age=self._max_age,
+                age_buckets=self._age_buckets,
+                checkpoint_path=self._checkpoint_path(),
+            )
+
+    def _checkpoint_path(self) -> Optional[str]:
+        if not self._checkpoint_dir:
+            return None
+        label_hash = hashlib.sha256(json.dumps(self._labelvalues).encode()).hexdigest()[:16]
+        return os.path.join(self._checkpoint_dir, f'{self._name}.{label_hash}.ckpt.json')
 
     def observe(self, amount: float) -> None:
         """Observe the given amount.
@@ -564,6 +632,20 @@ class Summary(MetricWrapperBase):
         self._raise_if_not_observable()
         self._count.inc(1)
         self._sum.inc(amount)
+        if self._estimator is not None:
+            self._estimator.observe(amount)
+
+    def flush(self) -> None:
+        """Persist the quantile estimator state to the checkpoint, if configured.
+
+        Called automatically on bucket rotation and at process exit; call
+        it explicitly before a controlled shutdown to bound state loss.
+        """
+        if self._is_parent():
+            for child in self._metrics.values():
+                child.flush()
+        elif self._estimator is not None:
+            self._estimator.flush()
 
     def time(self) -> Timer:
         """Time a block of code or function, and observe the duration in seconds.
@@ -577,6 +659,9 @@ class Summary(MetricWrapperBase):
             Sample('_count', {}, self._count.get(), None, None),
             Sample('_sum', {}, self._sum.get(), None, None),
         ]
+        if self._estimator is not None:
+            for quantile in sorted(self._objectives):
+                samples.append(Sample('', {'quantile': floatToGoString(quantile)}, self._estimator.query(quantile), None, None))
         if _use_created:
             samples.append(Sample('_created', {}, self._created, None, None))
         return tuple(samples)

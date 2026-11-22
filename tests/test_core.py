@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import math
 import os
+import tempfile
 from threading import Barrier, Event
 import time
 import unittest
@@ -313,6 +314,69 @@ class TestSummary(unittest.TestCase):
     def test_summary_not_observable(self):
         """.observe() must fail if the Summary is not observable."""
         assert_not_observable(self.summary_with_labels.observe, 1)
+
+    def test_summary_quantiles(self):
+        objectives = {0.5: 0.05, 0.9: 0.01, 0.99: 0.001}
+        summary = Summary('s_quantiles', 'help', objectives=objectives, registry=self.registry)
+        self.assertEqual(0, self.registry.get_sample_value('s_quantiles', {'quantile': '0.5'}))
+        for i in range(1, 1001):
+            summary.observe(float(i))
+        self.assertEqual(1000, self.registry.get_sample_value('s_quantiles_count'))
+        self.assertAlmostEqual(500, self.registry.get_sample_value('s_quantiles', {'quantile': '0.5'}), delta=100)
+        self.assertAlmostEqual(900, self.registry.get_sample_value('s_quantiles', {'quantile': '0.9'}), delta=40)
+        self.assertAlmostEqual(990, self.registry.get_sample_value('s_quantiles', {'quantile': '0.99'}), delta=10)
+
+    def test_summary_quantiles_with_labels(self):
+        summary = Summary('s_quantiles_labels', 'help', labelnames=('label1',),
+                          objectives={0.5: 0.05}, registry=self.registry)
+        summary.labels('foo').observe(10)
+        summary.labels('bar').observe(20)
+        self.assertEqual(10, self.registry.get_sample_value('s_quantiles_labels', {'label1': 'foo', 'quantile': '0.5'}))
+        self.assertEqual(20, self.registry.get_sample_value('s_quantiles_labels', {'label1': 'bar', 'quantile': '0.5'}))
+
+    def test_summary_quantiles_survive_restart(self):
+        objectives = {0.5: 0.05, 0.9: 0.01}
+        with tempfile.TemporaryDirectory() as checkpoint_dir:
+            summary = Summary('s_restart', 'help', objectives=objectives,
+                              checkpoint_dir=checkpoint_dir, registry=self.registry)
+            for i in range(1, 1001):
+                summary.observe(float(i))
+            summary.flush()
+
+            # Simulate a process restart: a fresh registry and Summary
+            # instance over the same checkpoint directory.
+            registry = CollectorRegistry()
+            restarted = Summary('s_restart', 'help', objectives=objectives,
+                                checkpoint_dir=checkpoint_dir, registry=registry)
+            # _count and _sum restart from zero, quantiles resume.
+            self.assertEqual(0, registry.get_sample_value('s_restart_count'))
+            self.assertAlmostEqual(500, registry.get_sample_value('s_restart', {'quantile': '0.5'}), delta=100)
+            self.assertAlmostEqual(900, registry.get_sample_value('s_restart', {'quantile': '0.9'}), delta=40)
+
+            restarted.observe(1000.0)
+            self.assertEqual(1, registry.get_sample_value('s_restart_count'))
+            self.assertAlmostEqual(500, registry.get_sample_value('s_restart', {'quantile': '0.5'}), delta=100)
+
+    def test_summary_quantiles_survive_restart_with_labels(self):
+        objectives = {0.5: 0.05}
+        with tempfile.TemporaryDirectory() as checkpoint_dir:
+            summary = Summary('s_restart_labels', 'help', labelnames=('label1',), objectives=objectives,
+                              checkpoint_dir=checkpoint_dir, registry=self.registry)
+            for i in range(1, 101):
+                summary.labels('foo').observe(float(i))
+            summary.flush()
+
+            registry = CollectorRegistry()
+            restarted = Summary('s_restart_labels', 'help', labelnames=('label1',), objectives=objectives,
+                                checkpoint_dir=checkpoint_dir, registry=registry)
+            # Creating the child loads its checkpointed estimator state.
+            restarted.labels('foo')
+            self.assertAlmostEqual(50, registry.get_sample_value(
+                's_restart_labels', {'label1': 'foo', 'quantile': '0.5'}), delta=10)
+
+    def test_summary_quantiles_invalid_objectives(self):
+        self.assertRaises(ValueError, Summary, 's_bad', 'help', objectives={}, registry=self.registry)
+        self.assertRaises(ValueError, Summary, 's_bad', 'help', objectives={1.5: 0.05}, registry=self.registry)
 
     def test_function_decorator(self):
         self.assertEqual(0, self.registry.get_sample_value('s_count'))

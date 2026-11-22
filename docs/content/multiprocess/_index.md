@@ -23,6 +23,12 @@ This comes with a number of limitations:
 - Gauges cannot use the `pid` label
 - Exemplars are not supported
 - Remove and Clear of labels are currently not supported in multiprocess mode.
+- Histograms must be registered with the same bucket boundaries in every
+  process. If processes disagree (for example during a rolling deployment that
+  changes buckets), the affected histogram series are dropped from the
+  aggregated output and a warning is emitted, rather than exposing corrupted
+  data. Other metrics are unaffected, and the histogram reappears once all
+  processes register the same buckets.
 
 There's several steps to getting this working:
 

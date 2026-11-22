@@ -47,6 +47,9 @@ class MultiProcessCollector:
     def _read_metrics(files):
         metrics = {}
         key_cache = {}
+        # Bucket boundaries seen per file for each histogram and label set,
+        # used to detect processes that registered different buckets.
+        histogram_buckets = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
 
         def _parse_key(key):
             val = key_cache.get(key)
@@ -81,9 +84,41 @@ class MultiProcessCollector:
                     metric._multiprocess_mode = parts[1]
                     metric.add_sample(name, labels_key + (('pid', pid),), value, timestamp)
                 else:
+                    if typ == 'histogram' and name == metric_name + '_bucket':
+                        le = labels.get('le')
+                        if le is not None:
+                            without_le = tuple(l for l in labels_key if l[0] != 'le')
+                            histogram_buckets[metric_name][without_le][f].add(float(le))
                     # The duplicates and labels are fixed in the next for.
                     metric.add_sample(name, labels_key, value)
+        for metric_name, by_labels in histogram_buckets.items():
+            metrics[metric_name]._file_buckets = {
+                labels: dict(per_file) for labels, per_file in by_labels.items()
+            }
         return metrics
+
+    @staticmethod
+    def _inconsistent_histogram_labels(metric):
+        """Label sets whose bucket boundaries differ between processes."""
+        inconsistent = set()
+        for labels, per_file in getattr(metric, '_file_buckets', {}).items():
+            distinct = {frozenset(bounds) for bounds in per_file.values()}
+            if len(distinct) > 1:
+                inconsistent.add(labels)
+        if inconsistent:
+            details = {
+                labels: sorted(
+                    [sorted(bounds) for bounds in
+                     {frozenset(b) for b in metric._file_buckets[labels].values()}]
+                )
+                for labels in sorted(inconsistent)
+            }
+            warnings.warn(
+                'Histogram {} has inconsistent bucket boundaries across '
+                'processes, dropping affected series: {}. All processes must '
+                'register the histogram with the same buckets.'.format(
+                    metric.name, details))
+        return inconsistent
 
     @staticmethod
     def _accumulate_metrics(metrics, accumulate):
@@ -91,6 +126,9 @@ class MultiProcessCollector:
             samples = defaultdict(lambda: defaultdict(float))
             sample_timestamps = defaultdict(lambda: defaultdict(float))
             buckets = defaultdict(lambda: defaultdict(float))
+            inconsistent_labels = set()
+            if metric.type == 'histogram':
+                inconsistent_labels = MultiProcessCollector._inconsistent_histogram_labels(metric)
             for s in metric.samples:
                 name, labels, value, timestamp, exemplar, native_histogram_value = s
 
@@ -126,13 +164,16 @@ class MultiProcessCollector:
                         samples[labels][(name, labels)] = value
 
                 elif metric.type == 'histogram':
+                    without_le = tuple(l for l in labels if l[0] != 'le')
+                    if without_le in inconsistent_labels:
+                        # Bucket boundaries disagree between processes, so
+                        # these series cannot be merged meaningfully.
+                        continue
                     # A for loop with early exit is faster than a genexpr
                     # or a listcomp that ends up building unnecessary things
                     for l in labels:
                         if l[0] == 'le':
                             bucket_value = float(l[1])
-                            # _bucket
-                            without_le = tuple(l for l in labels if l[0] != 'le')
                             buckets[without_le][bucket_value] += value
                             break
                     else:  # did not find the `le` key
@@ -164,7 +205,7 @@ class MultiProcessCollector:
             for _, samples_by_labels in samples.items():
                 for (name_, labels), value in samples_by_labels.items():
                     metric.samples.append(Sample(name_, dict(labels), value))
-        return metrics.values()
+        return [m for m in metrics.values() if m.samples]
 
     def collect(self):
         files = glob.glob(os.path.join(self._path, '*.db'))

@@ -144,6 +144,41 @@ class TestMultiProcess(unittest.TestCase):
         self.assertIn(b'h_sum{l="x"} 1.5', om_2_0)
         self.assertIn(b'h_count{l="x"} 2.0', om_2_0)
 
+    def test_histogram_inconsistent_buckets(self):
+        h1 = Histogram('h', 'help', buckets=[1, 2], registry=None)
+        values.ValueClass = MultiProcessValue(lambda: 456)
+        h2 = Histogram('h', 'help', buckets=[1, 3], registry=None)
+        c = Counter('c', 'help', registry=None)
+        h1.observe(0.5)
+        h2.observe(0.5)
+        c.inc(1)
+
+        with self.assertWarns(UserWarning):
+            self.assertIsNone(self.registry.get_sample_value('h_count'))
+        # Other metrics are unaffected by the inconsistent histogram.
+        self.assertEqual(1, self.registry.get_sample_value('c_total'))
+
+    def test_histogram_inconsistent_buckets_per_label_set(self):
+        h1 = Histogram('h', 'help', labelnames=['l'], buckets=[1, 2], registry=None)
+        h1_x = h1.labels('x')
+        h1_y = h1.labels('y')
+        values.ValueClass = MultiProcessValue(lambda: 456)
+        h2 = Histogram('h', 'help', labelnames=['l'], buckets=[1, 3], registry=None)
+        h2_x = h2.labels('x')
+        values.ValueClass = MultiProcessValue(lambda: 789)
+        h3 = Histogram('h', 'help', labelnames=['l'], buckets=[1, 2], registry=None)
+        h3_y = h3.labels('y')
+        h1_x.observe(0.5)
+        h2_x.observe(0.5)
+        h1_y.observe(0.5)
+        h3_y.observe(0.5)
+
+        with self.assertWarns(UserWarning):
+            self.assertIsNone(self.registry.get_sample_value('h_count', {'l': 'x'}))
+        # The label set with matching buckets is still aggregated.
+        self.assertEqual(2, self.registry.get_sample_value('h_count', {'l': 'y'}))
+        self.assertEqual(2, self.registry.get_sample_value('h_bucket', {'l': 'y', 'le': '+Inf'}))
+
     def test_gauge_all(self):
         g1 = Gauge('g', 'help', registry=None)
         values.ValueClass = MultiProcessValue(lambda: 456)
